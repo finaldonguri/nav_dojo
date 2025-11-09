@@ -183,13 +183,199 @@ Cesium.Ion.defaultAccessToken =
 
             if (entity.polyline) {
                 if (style === "arrow" || name === "B") {
+                    entity.show = false;
                     // 線B（矢印）
-                    const yellowTrans = Cesium.Color.YELLOW.withAlpha(0.5);
-                    entity.polyline.width = Math.round(25 * uiScale);
-                    entity.polyline.material = new Cesium.PolylineArrowMaterialProperty(yellowTrans);
-                    entity.polyline.clampToGround = false;
-                    entity.polyline.heightReference = Cesium.HeightReference.NONE;
-                    guideBEntities.push(entity);
+                    // ★追加: 線Bを「時間で伸びる矢印」に差し替え
+                    // - 既に guideBEntities には GeoJSONから作られた静的Bが入っているので非表示にして自前のBを作る
+                    // - MultiLineStringの最初のラインを採用（必要なら結合ロジックを拡張）
+                    const speedB_mps = 60;                  // ★速度[m/s] 好みで
+                    const arrowWidthPx = Math.round(25 * uiScale);
+                    const arrowColor = Cesium.Color.YELLOW.withAlpha(0.8);
+
+                    function flattenFirstLineOfMultiLineString(geojson) {
+                        const featB = geojson.features.find(f => f.properties?.name === "B" || f.properties?.style === "arrow");
+                        if (!featB) return [];
+                        const g = featB.geometry;
+                        if (g.type === "LineString") return g.coordinates;
+                        if (g.type === "MultiLineString") return g.coordinates[0] || [];
+                        return [];
+                    }
+
+                    const lineBCoords = flattenFirstLineOfMultiLineString(routeGeojson);
+                    // 高度付き想定（地面追従OFF）。高さが無ければ 0 でOK
+                    const pCartB = lineBCoords.map(([lon, lat, h = 0]) => Cesium.Cartesian3.fromDegrees(lon, lat, h));
+                    // ★追加: 最低2点チェック
+                    if (pCartB.length < 2) {
+                        console.warn("Line B needs at least two points");
+                        return; // （このスコープ＝async IIFE 内の早期リターンでOK）
+                    }
+                    // 累積距離
+                    const cumDistB = [0];
+                    for (let i = 1; i < pCartB.length; i++) {
+                        cumDistB[i] = cumDistB[i - 1] + Cesium.Cartesian3.distance(pCartB[i - 1], pCartB[i]);
+                    }
+                    const totalDistB = cumDistB[cumDistB.length - 1];
+
+                    // 時間設定（距離/速度）
+                    const startB = Cesium.JulianDate.now();
+                    const totalSecB = totalDistB / Math.max(1e-6, speedB_mps);
+                    const stopB = Cesium.JulianDate.addSeconds(startB, totalSecB, new Cesium.JulianDate());
+
+                    // 先端カーソル（SampledPositionProperty）
+                    const cursorPosB = new Cesium.SampledPositionProperty();
+                    {
+                        let t = Cesium.JulianDate.clone(startB);
+                        cursorPosB.addSample(t, pCartB[0]);
+                        for (let i = 1; i < pCartB.length; i++) {
+                            const seg = cumDistB[i] - cumDistB[i - 1];
+                            t = Cesium.JulianDate.addSeconds(t, seg / Math.max(1e-6, speedB_mps), new Cesium.JulianDate());
+                            cursorPosB.addSample(t, pCartB[i]);
+                        }
+                        cursorPosB.setInterpolationOptions({
+                            interpolationAlgorithm: Cesium.LagrangePolynomialApproximation,
+                            interpolationDegree: 2
+                        });
+                    }
+
+                    // 伸びる矢印：現在時刻までの座標列を返す
+                    const growPositionsB = new Cesium.CallbackProperty((time, result) => {
+                        const elapsed = Cesium.JulianDate.secondsDifference(time, startB);
+                        const dNow = Cesium.Math.clamp(elapsed * speedB_mps, 0, totalDistB);
+
+                        // 区間探索
+                        let i = 1;
+                        while (i < cumDistB.length && cumDistB[i] < dNow) i++;
+
+                        const pts = [];
+                        for (let k = 0; k < i; k++) pts.push(pCartB[k]);
+                        if (i < pCartB.length) {
+                            const d0 = cumDistB[i - 1], d1 = cumDistB[i];
+                            const t01 = (dNow - d0) / Math.max(1e-6, (d1 - d0));
+                            const cur = Cesium.Cartesian3.lerp(pCartB[i - 1], pCartB[i], t01, new Cesium.Cartesian3());
+                            pts.push(cur); // 先端
+                        }
+                        return pts;
+                    }, false);
+
+                    // 既存の静的Bは非表示にしておく（トグルの対象から外すなら配列も調整）
+                    guideBEntities.forEach(ent => ent.show = false);
+                    guideBEntities.length = 0; // クリアして、以下の自前Bを登録
+
+                    // 伸びる矢印本体
+                    const lineBAnimated = viewer.entities.add({
+                        polyline: {
+                            positions: growPositionsB,
+                            width: arrowWidthPx,
+                            material: new Cesium.PolylineArrowMaterialProperty(arrowColor),
+                            clampToGround: false,
+                            heightReference: Cesium.HeightReference.NONE
+                        }
+                    });
+                    guideBEntities.push(lineBAnimated);
+                    /*
+                    // 先端カーソル（追従対象）
+                    const cursorEntityB = viewer.entities.add({
+                      position: cursorPosB,
+                      orientation: new Cesium.VelocityOrientationProperty(cursorPosB),
+                      billboard: {
+                        image: new Cesium.PinBuilder().fromColor(Cesium.Color.ORANGE, 32).toDataURL(),
+                        scale: 1.2,
+                        disableDepthTestDistance: Number.POSITIVE_INFINITY
+                      }
+                    });
+                    */
+
+                    // 時計設定
+                    viewer.clock.startTime = Cesium.JulianDate.clone(startB);
+                    viewer.clock.stopTime = Cesium.JulianDate.clone(stopB);
+                    viewer.clock.currentTime = Cesium.JulianDate.clone(startB);
+                    viewer.clock.clockRange = Cesium.ClockRange.CLAMPED; // 終端で停止
+                    viewer.clock.multiplier = 1;
+                    viewer.clock.shouldAnimate = true;
+
+                    /*
+                    // タイムウィンドウ外は非表示（任意）
+                    const showIntervalsB = new Cesium.TimeIntervalCollectionProperty();
+                    showIntervalsB.intervals.addInterval(new Cesium.TimeInterval({ start: startB, stop: stopB, data: true }));
+                    lineBAnimated.show = showIntervalsB;
+                    cursorEntityB.show = showIntervalsB;
+                    */
+
+                    // ★trackedEntityは使わない（preRenderのみで完全制御）
+                    viewer.trackedEntity = undefined; // ← 以前の viewer.trackedEntity = cursorEntityB を外す
+
+                    // ★キーフレーム定義：進捗 at は 0.0～1.0（= 到達距離 / 全距離）
+                    //   角度はラジアン指定（degから変換してOK）。range はターゲット（先端）からの距離[m]。
+                    const cameraKeys = [
+                        { at: 0.00, heading: Cesium.Math.toRadians(20), pitch: Cesium.Math.toRadians(-25), range: 350 },
+                        { at: 0.25, heading: Cesium.Math.toRadians(60), pitch: Cesium.Math.toRadians(-35), range: 420 },
+                        { at: 0.55, heading: Cesium.Math.toRadians(120), pitch: Cesium.Math.toRadians(-30), range: 380 },
+                        { at: 0.80, heading: Cesium.Math.toRadians(-140), pitch: Cesium.Math.toRadians(-20), range: 500 },
+                        { at: 1.00, heading: Cesium.Math.toRadians(-10), pitch: Cesium.Math.toRadians(-35), range: 320 },
+                    ];
+
+                    // 角度補間（-π..π の最短経路で補間）
+                    function lerpAngle(a, b, t) {
+                        const TWO_PI = Math.PI * 2;
+                        let d = (b - a) % TWO_PI;
+                        if (d > Math.PI) d -= TWO_PI;
+                        if (d < -Math.PI) d += TWO_PI;
+                        return a + d * t;
+                    }
+
+                    // 0..1 の進捗から、前後のキーフレームを見つけて補間した HPR を返す
+                    function sampleCameraHPR(f) {
+                        f = Cesium.Math.clamp(f, 0.0, 1.0);
+                        // 端の処理
+                        if (f <= cameraKeys[0].at) return cameraKeys[0];
+                        if (f >= cameraKeys[cameraKeys.length - 1].at) return cameraKeys[cameraKeys.length - 1];
+
+                        // 区間探索
+                        let i = 1;
+                        while (i < cameraKeys.length && cameraKeys[i].at < f) i++;
+                        const a = cameraKeys[i - 1], b = cameraKeys[i];
+                        const t = (f - a.at) / Math.max(1e-6, (b.at - a.at));
+
+                        return {
+                            at: f,
+                            heading: lerpAngle(a.heading, b.heading, t),
+                            pitch: lerpAngle(a.pitch, b.pitch, t),
+                            range: Cesium.Math.lerp(a.range, b.range, t),
+                        };
+                    }
+
+                    // 到達距離 dNow と進捗 f を返すヘルパ
+                    function progressAt(time) {
+                        const elapsed = Cesium.JulianDate.secondsDifference(time, startB);
+                        const dNow = Cesium.Math.clamp(elapsed * speedB_mps, 0, totalDistB);
+                        const f = totalDistB > 0 ? dNow / totalDistB : 0;
+                        return { dNow, f };
+                    }
+
+                    // ★キーフレーム駆動のカメラ追従（毎フレーム）
+                    const camHandlerB = (scene, time) => {
+                        const tip = cursorPosB.getValue(time);
+                        if (!tip) return;
+
+                        // 進捗を取得
+                        const { f } = progressAt(time);
+                        const hpr = sampleCameraHPR(f);
+
+                        // 先端を画面中心に、HPRはキーフレーム補間値
+                        viewer.camera.lookAt(
+                            tip,
+                            new Cesium.HeadingPitchRange(hpr.heading, hpr.pitch, hpr.range)
+                        );
+                    };
+                    viewer.scene.preRender.addEventListener(camHandlerB);
+
+                    // 終了時はカメラ拘束を解除
+                    viewer.clock.onStop.addEventListener(() => {
+                        try { viewer.scene.preRender.removeEventListener(camHandlerB); } catch { }
+                        viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
+                    });
+
+
                 } else {
                     // 線A（赤の点線）
                     entity.polyline.material = new Cesium.PolylineDashMaterialProperty({
